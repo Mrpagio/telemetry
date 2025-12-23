@@ -1,4 +1,4 @@
-module github.com/jacopomanzoli/telemetry
+module github.com/Mrpagio/telemetry
 
 go 1.24.0
 
