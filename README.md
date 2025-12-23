@@ -123,15 +123,15 @@ Nota: Nel repository di esempio i test definiscono un `fakeMeter` e un `fakeSlog
 
 Se la libreria è pubblicata su GitHub sotto `github.com/jacopomanzoli/telemetry`, nel tuo `go.mod` del progetto consumer aggiungi:
 
-    require github.com/jacopomanzoli/telemetry v0.0.0
+    require github.com/Mrpagio/telemetry v0.0.0
 
 (per sviluppo locale puoi usare una direttiva `replace` per puntare alla copia locale del repository):
 
-    replace github.com/jacopomanzoli/telemetry => ../path/to/local/telemetry
+    replace github.com/Mrpagio/telemetry => ../path/to/local/telemetry
 
 Dopo aver aggiunto la dipendenza, importa il package:
 
-    import "github.com/jacopomanzoli/telemetry/pkg"
+    import "github.com/Mrpagio/telemetry/pkg"
 
 Suggerimenti e next steps
 -------------------------
