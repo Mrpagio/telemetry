@@ -1,0 +1,297 @@
+package pkg
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+	"log/slog"
+)
+
+// fakeCounter registra le chiamate a Add per ispezione nei test
+type counterCall struct {
+	ctx   context.Context
+	value int64
+}
+
+type fakeCounter struct {
+	name  string
+	calls *[]counterCall
+}
+
+func (f *fakeCounter) Add(ctx context.Context, value int64, _ ...metric.AddOption) {
+	*f.calls = append(*f.calls, counterCall{ctx: ctx, value: value})
+}
+
+// implementa le interfacce usate (Int64CounterLike e Int64UpDownCounterLike hanno lo stesso metodo Add)
+
+// fakeMeter crea strumenti fake che registrano le chiamate
+type fakeMeter struct {
+	counters map[string]*[]counterCall
+}
+
+func newFakeMeter() *fakeMeter {
+	return &fakeMeter{counters: map[string]*[]counterCall{}}
+}
+
+func (m *fakeMeter) Int64Counter(name string, _ ...metric.InstrumentOption) (Int64CounterLike, error) {
+	arr := make([]counterCall, 0)
+	m.counters[name] = &arr
+	return &fakeCounter{name: name, calls: m.counters[name]}, nil
+}
+
+func (m *fakeMeter) Int64UpDownCounter(name string, _ ...metric.InstrumentOption) (Int64UpDownCounterLike, error) {
+	arr := make([]counterCall, 0)
+	m.counters[name] = &arr
+	// riuso fakeCounter poiché Add ha la stessa forma
+	return &fakeCounter{name: name, calls: m.counters[name]}, nil
+}
+
+// fakeSlogHandler cattura i record inoltrati e permette di sincronizzare i test
+type fakeSlogHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+	wg      *sync.WaitGroup
+}
+
+func newFakeSlogHandler() *fakeSlogHandler {
+	return &fakeSlogHandler{}
+}
+
+func (f *fakeSlogHandler) Handle(ctx context.Context, r slog.Record) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.records = append(f.records, r)
+	if f.wg != nil {
+		f.wg.Done()
+	}
+	return nil
+}
+
+func (f *fakeSlogHandler) Enabled(ctx context.Context, level slog.Level) bool { return true }
+func (f *fakeSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler           { return f }
+func (f *fakeSlogHandler) WithGroup(name string) slog.Handler                 { return f }
+
+// helper: aspetta fino a timeout che il fake handler abbia almeno n record
+func waitForRecords(t *testing.T, fh *fakeSlogHandler, n int, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		fh.mu.Lock()
+		cnt := len(fh.records)
+		fh.mu.Unlock()
+		if cnt >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d records, got %d", n, len(fh.records))
+}
+
+// Test 1: forwarding when no trace present
+func TestForwardingNoTrace(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	h := NewAsyncBufferedHandler(next, fm, 10, 200*time.Millisecond)
+	defer h.Close()
+
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "no-trace", 0)
+	var ctx = context.Background()
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	next.wg = wg
+	_ = h.Handle(ctx, r)
+	// aspetta che next riceva
+	c := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(c)
+	}()
+	select {
+	case <-c:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for next.Handle for no-trace record")
+	}
+}
+
+// Test 2: buffering + EndSpanSuccess (should cleanup without flush)
+func TestBufferingEndSpanSuccess(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	h := NewAsyncBufferedHandler(next, fm, 10, 200*time.Millisecond)
+	defer h.Close()
+
+	// costruisco un ctx con SpanContext valido contenente un traceID
+	var tid trace.TraceID
+	copy(tid[:], []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	var sid trace.SpanID
+	copy(sid[:], []byte{1, 2, 3, 4, 5, 6, 7, 8})
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	// sanity check sulla validità del contesto
+	if !sc.IsValid() {
+		t.Fatalf("constructed span context is invalid")
+	}
+
+	// Detect unexpected forwards: se next.Handle viene chiamato quando non dovrebbe,
+	// il WaitGroup si decrementarà e il test fallirà.
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	next.wg = wg
+
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "buffered", 0)
+	_ = h.Handle(ctx, r)
+
+	// aspetta che il buffer sia stato creato dal worker
+	bufferCreated := false
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		_, bufferCreated = h.buffers[tid.String()]
+		h.mu.Unlock()
+		if bufferCreated {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !bufferCreated {
+		t.Fatalf("buffer for trace %s was not created in time", tid.String())
+	}
+
+	// aspetta brevemente per verificare che NON sia stato forwarded
+	select {
+	case <-func() chan struct{} {
+		c := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(c)
+		}()
+		return c
+	}():
+		// raccolgo dettagli sul record inoltrato
+		next.mu.Lock()
+		var msg string
+		if len(next.records) > 0 {
+			msg = next.records[0].Message
+		}
+		next.mu.Unlock()
+		t.Fatalf("unexpected forward to next.Handle immediately after Handle; forwarded message=%q", msg)
+	case <-time.After(100 * time.Millisecond):
+		// ok, non è stato forwarded
+	}
+
+	// chiudo lo span con successo: non deve flushare i record
+	h.EndSpanSuccess(ctx, tid.String())
+
+	// attendiamo ancora un breve periodo per assicurarci che non arrivi nulla
+	wg2 := &sync.WaitGroup{}
+	wg2.Add(1)
+	next.wg = wg2
+	select {
+	case <-func() chan struct{} {
+		c := make(chan struct{})
+		go func() {
+			wg2.Wait()
+			close(c)
+		}()
+		return c
+	}():
+		// raccolgo dettagli sul record inoltrato
+		next.mu.Lock()
+		var msg2 string
+		if len(next.records) > 0 {
+			msg2 = next.records[0].Message
+		}
+		next.mu.Unlock()
+		t.Fatalf("unexpected forward to next.Handle after EndSpanSuccess; forwarded message=%q", msg2)
+	case <-time.After(100 * time.Millisecond):
+		// ok, non è stato forwarded
+	}
+}
+
+// Test 3: immediate flush on error level
+func TestImmediateFlushOnError(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	h := NewAsyncBufferedHandler(next, fm, 10, 200*time.Millisecond)
+	defer h.Close()
+
+	var tid trace.TraceID
+	copy(tid[:], []byte{2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	var sid trace.SpanID
+	copy(sid[:], []byte{2, 2, 3, 4, 5, 6, 7, 8})
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	r := slog.NewRecord(time.Now(), slog.LevelError, "errnow", 0)
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	next.wg = wg
+	_ = h.Handle(ctx, r)
+	// Wait for flush
+	c := make(chan struct{})
+	go func() { wg.Wait(); close(c) }()
+	select {
+	case <-c:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for immediate flush on error level")
+	}
+}
+
+// Test 4: timeout triggers flush
+func TestTimeoutTriggersFlush(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	h := NewAsyncBufferedHandler(next, fm, 10, 50*time.Millisecond)
+	defer h.Close()
+
+	var tid trace.TraceID
+	copy(tid[:], []byte{3, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	var sid trace.SpanID
+	copy(sid[:], []byte{3, 2, 3, 4, 5, 6, 7, 8})
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	next.wg = wg
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "to-be-timed-out", 0)
+	_ = h.Handle(ctx, r)
+	// aspetta che il timer faccia il flush
+	c := make(chan struct{})
+	go func() { wg.Wait(); close(c) }()
+	select {
+	case <-c:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for timeout-based flush")
+	}
+}
+
+// Test 5: drop when channel is full
+func TestDropWhenChannelFull(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	// create handler with small buffer to provoke drops without reassigning channel
+	h := NewAsyncBufferedHandler(next, fm, 1, 200*time.Millisecond)
+	defer h.Close()
+
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "droptest", 0)
+	// rapidly call Handle many times to trigger drops
+	for i := 0; i < 200; i++ {
+		_ = h.Handle(context.Background(), r)
+	}
+	// slight wait to allow async counters to be updated
+	time.Sleep(50 * time.Millisecond)
+
+	// verifico che il contatore di drop sul fake meter sia stato incrementato
+	calls := fm.counters["logging_dropped_operations"]
+	if calls == nil || len(*calls) == 0 {
+		t.Fatalf("expected dropCounter.Add to be called at least once, got 0 calls")
+	}
+}
