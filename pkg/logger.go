@@ -61,12 +61,31 @@ type LogCommand struct {
 
 // ---- GESTORE ASINCRONO BUFFERIZZATO -----
 
+// AsyncBufferedHandler è un handler che bufferizza i log per traceID e li
+// flusha in determinate condizioni (timeout, error, esplicito EndSpanError).
+//
+// Nuovo: supporta policy di timeout per singolo span tramite la mappa
+// perSpanTimeouts: map[traceID]*time.Duration
+// - valore == nil    => timeout DISABILITATO per quello span (mai OpTimeout)
+// - valore != nil && *v == 0 => usa timeout di default dell'handler
+// - valore != nil && *v > 0 => usa durata specificata
+//
+// Questo permette di avere timeout personalizzati per span oppure disabilitarli
+// quando, ad esempio, uno span dura molto a lungo e non si vuole che venga
+// flushato automaticamente.
 type AsyncBufferedHandler struct {
-	next            slog.Handler             // Handler successivo nella catena
-	channel         chan LogCommand          // Canale per i comandi di log
-	mu              *sync.Mutex              // Mutex per la sincronizzazione (puntatore per evitare copie accidentali)
-	buffers         map[string][]slog.Record // Buffer per i log per traceID
-	timers          map[string]*time.Timer   // Timer attivi per traceID
+	next    slog.Handler             // Handler successivo nella catena
+	channel chan LogCommand          // Canale per i comandi di log
+	mu      *sync.Mutex              // Mutex per la sincronizzazione (puntatore per evitare copie accidentali)
+	buffers map[string][]slog.Record // Buffer per i log per traceID
+	timers  map[string]*time.Timer   // Timer attivi per traceID
+	// perSpanTimeouts mantiene la policy di timeout per ogni traceID:
+	// - nil pointer (value == nil) => timeout DISABILITATO per quello span (mai OpTimeout)
+	// - non-nil pointer con valore == 0 => usare il timeout di default h.timeoutDuration
+	// - non-nil pointer con valore > 0 => usare la durata specificata
+	perSpanTimeouts map[string]*time.Duration
+	// timeoutDuration è il valore di default per gli span per i quali non sia
+	// stata impostata una policy esplicita (o per i quali la policy punta a 0).
 	timeoutDuration time.Duration
 	attrs           []slog.Attr // attributi da aggiungere ai record
 	meter           MyMeter     // Adattatore del Meter OTel
@@ -93,6 +112,7 @@ func NewAsyncBufferedHandler(next slog.Handler, meter MyMeter, bufferSize int, t
 		channel:         make(chan LogCommand, bufferSize),
 		buffers:         make(map[string][]slog.Record),
 		timers:          make(map[string]*time.Timer),
+		perSpanTimeouts: make(map[string]*time.Duration), // inizializziamo la mappa
 		timeoutDuration: timeout,
 		mu:              &sync.Mutex{},
 		wg:              &sync.WaitGroup{},
@@ -102,7 +122,7 @@ func NewAsyncBufferedHandler(next slog.Handler, meter MyMeter, bufferSize int, t
 	var c int32 = 0
 	h.closed = &c
 
-	// Inizializzazione delle metriche usando il meter fornito
+	// Inizializzazione delle metriche usando il meter fornito (manteniamo initMetrics)
 	h.initMetrics()
 
 	// avvio worker con waitgroup per permettere un shutdown controllato
@@ -123,6 +143,7 @@ func (h *AsyncBufferedHandler) SetMeter(meter MyMeter) {
 	h.initMetrics()
 }
 
+// initMetrics resta intatto: inizializza gli strumenti dal meter se presente.
 func (h *AsyncBufferedHandler) initMetrics() {
 	if h.meter != nil {
 		// Le API del meter ritornano (instrument, error) — qui scartiamo l'errore con _.
@@ -139,6 +160,71 @@ func (h *AsyncBufferedHandler) initMetrics() {
 		h.errorCounter = nil
 		h.dropCounter = nil
 		h.activeSpansGauge = nil
+	}
+}
+
+// StartSpan permette di impostare una policy di timeout per uno specifico traceID.
+// Il parametro timeout è un puntatore *time.Duration per permettere tre comportamenti:
+//   - timeout == nil => timeout DISABILITATO per quello span (mai OpTimeout)
+//   - timeout != nil && *timeout == 0 => usare il timeout di default dell'handler
+//   - timeout != nil && *timeout > 0 => usare la durata specificata
+//
+// Se traceID è vuoto, proviamo a ricavarlo dal contesto. Metodo thread-safe.
+func (h *AsyncBufferedHandler) StartSpan(ctx context.Context, traceID string, timeout *time.Duration) {
+	// se non fornito, recupera il traceID dal contesto (se esiste)
+	if traceID == "" {
+		s := trace.SpanContextFromContext(ctx)
+		if s.IsValid() {
+			traceID = s.TraceID().String()
+		}
+	}
+	if traceID == "" {
+		// non abbiamo un traceID valido: niente da impostare
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Assicuriamoci che esista il buffer per il traceID; se non esiste lo creiamo
+	// e, se è presente un meter, incrementiamo il contatore degli span attivi.
+	if _, exists := h.buffers[traceID]; !exists {
+		h.buffers[traceID] = make([]slog.Record, 0)
+		if h.meter != nil {
+			h.activeSpansGauge.Add(ctx, 1)
+		}
+	}
+
+	// Memorizziamo la policy per questo span (nil => timeout disabilitato)
+	h.perSpanTimeouts[traceID] = timeout
+
+	// Gestiamo il timer associato in base alla policy:
+	// - timeout == nil => rimuoviamo qualunque timer esistente (nessun OpTimeout)
+	// - timeout != nil => creiamo o resettiamo il timer con la durata corretta
+	if timeout == nil {
+		if t, ok := h.timers[traceID]; ok {
+			t.Stop()
+			delete(h.timers, traceID)
+		}
+		return
+	}
+
+	// calcoliamo la durata effettiva: 0 nel puntatore significa usare il default dell'handler
+	dur := h.timeoutDuration
+	if *timeout > 0 {
+		dur = *timeout
+	}
+
+	if t, ok := h.timers[traceID]; ok {
+		t.Reset(dur)
+	} else {
+		tr := traceID
+		h.timers[tr] = time.AfterFunc(dur, func() {
+			select {
+			case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
+			default:
+			}
+		})
 	}
 }
 
@@ -206,20 +292,35 @@ func (h *AsyncBufferedHandler) processOpReleaseError(cmd LogCommand) {
 		r.AddAttrs(slog.String("err", cmd.Err.Error()))
 		// Aggiungiamo il record al buffer in modo thread-safe
 		h.mu.Lock()
-		// assicurati che esista un timer per il traceID
+		// assicurati che esista un timer per il traceID, ma rispetta la policy per-span se presente
 		if _, exists := h.timers[cmd.TraceID]; !exists {
-			if h.meter != nil {
-				// eseguito solo se il meter è impostato
-				h.activeSpansGauge.Add(cmd.Context, 1)
-			}
-			// creazione timer non-bloccante: invio OpTimeout sul canale
-			tr := cmd.TraceID
-			h.timers[tr] = time.AfterFunc(h.timeoutDuration, func() {
-				select {
-				case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
-				default:
+			// Verifichiamo se esiste una policy per questo span
+			if policy, has := h.perSpanTimeouts[cmd.TraceID]; has {
+				if policy != nil {
+					// policy non-nil: usare la durata indicata (0 => handler default)
+					d := h.timeoutDuration
+					if *policy > 0 {
+						d = *policy
+					}
+					tr := cmd.TraceID
+					h.timers[tr] = time.AfterFunc(d, func() {
+						select {
+						case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
+						default:
+						}
+					})
 				}
-			})
+				// se policy == nil => timeout disabilitato -> non creare timer
+			} else {
+				// nessuna policy specifica -> comportamento di default
+				tr := cmd.TraceID
+				h.timers[tr] = time.AfterFunc(h.timeoutDuration, func() {
+					select {
+					case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
+					default:
+					}
+				})
+			}
 		}
 		// bufferizzo il record di errore
 		h.buffers[cmd.TraceID] = append(h.buffers[cmd.TraceID], r)
@@ -301,6 +402,7 @@ func (h *AsyncBufferedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		mu:              h.mu,
 		buffers:         h.buffers,
 		timers:          h.timers,
+		perSpanTimeouts: h.perSpanTimeouts,
 		timeoutDuration: h.timeoutDuration,
 		attrs:           newTotalAttrs,
 		meter:           h.meter,
@@ -317,7 +419,6 @@ func (h *AsyncBufferedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 }
 
-// WithGroup restituisce un nuovo gestore che racchiude i log successivi all'interno di un gruppo (namespace)
 func (h *AsyncBufferedHandler) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
@@ -330,6 +431,7 @@ func (h *AsyncBufferedHandler) WithGroup(name string) slog.Handler {
 		mu:              h.mu,
 		buffers:         h.buffers,
 		timers:          h.timers,
+		perSpanTimeouts: h.perSpanTimeouts,
 		timeoutDuration: h.timeoutDuration,
 		attrs:           h.attrs,
 		meter:           h.meter,
@@ -375,16 +477,35 @@ func (h *AsyncBufferedHandler) handleLogRecord(cmd LogCommand) {
 			h.activeSpansGauge.Add(cmd.Context, 1)
 		}
 	}
-	// se non esiste un timer, ne creo uno
+	// se non esiste un timer, ne creo uno rispettando la policy per-span (se presente)
 	if _, exists := h.timers[tID]; !exists {
-		// creazione timer non-bloccante: time.AfterFunc che manda OpTimeout sul canale
-		tr := tID
-		h.timers[tr] = time.AfterFunc(h.timeoutDuration, func() {
-			select {
-			case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
-			default:
+		// controlliamo se esiste una policy per questo span
+		if policy, has := h.perSpanTimeouts[tID]; has {
+			if policy != nil {
+				// policy non-nil: 0 => default handler timeout; >0 => custom timeout
+				dur := h.timeoutDuration
+				if *policy > 0 {
+					dur = *policy
+				}
+				tr := tID
+				h.timers[tr] = time.AfterFunc(dur, func() {
+					select {
+					case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
+					default:
+					}
+				})
 			}
-		})
+			// se policy == nil -> timeout disabilitato: non creare timer
+		} else {
+			// nessuna policy specifica => comportamento di default
+			tr := tID
+			h.timers[tr] = time.AfterFunc(h.timeoutDuration, func() {
+				select {
+				case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
+				default:
+				}
+			})
+		}
 	}
 	// Aggiungo gli attributi al record di log
 	cmd.Record.AddAttrs(cmd.Tags...)
@@ -422,6 +543,8 @@ func (h *AsyncBufferedHandler) flush(ctx context.Context, traceID string) {
 			t.Stop()
 			delete(h.timers, traceID)
 		}
+		// Rimuovo anche la policy per-span associata, se presente
+		delete(h.perSpanTimeouts, traceID)
 		if h.meter != nil {
 			// Eseguito solo se il meter è impostato
 			// Aggiorno il contatore dei record attivi
@@ -459,6 +582,8 @@ func (h *AsyncBufferedHandler) cleanup(ctx context.Context, traceID string) {
 			t.Stop()
 			delete(h.timers, traceID)
 		}
+		// Rimuovo anche la policy per-span
+		delete(h.perSpanTimeouts, traceID)
 	}
 	h.mu.Unlock()
 }
@@ -487,6 +612,8 @@ func (h *AsyncBufferedHandler) EndSpanSuccess(ctx context.Context, traceID strin
 		// Rimuovo il buffer
 		delete(h.buffers, traceID)
 	}
+	// Rimuovo anche la policy per-span associata
+	delete(h.perSpanTimeouts, traceID)
 	h.mu.Unlock()
 
 	if h.meter != nil {

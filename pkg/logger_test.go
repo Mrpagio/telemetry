@@ -474,3 +474,127 @@ func TestDropWhenChannelFull_MeterNil(t *testing.T) {
 		t.Fatalf("invalid records count: %d", cnt)
 	}
 }
+
+// Test: per-span custom timeout triggers flush at custom duration
+func TestPerSpanCustomTimeout(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	// default lungo, user custom corto
+	h := NewAsyncBufferedHandler(next, fm, 10, 200*time.Millisecond)
+	defer h.Close()
+
+	var tid trace.TraceID
+	copy(tid[:], []byte{9, 9, 9, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	var sid trace.SpanID
+	copy(sid[:], []byte{9, 9, 3, 4, 5, 6, 7, 8})
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	// imposto timeout custom brevissimo
+	custom := 50 * time.Millisecond
+	h.StartSpan(ctx, tid.String(), &custom)
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	next.wg = wg
+
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "per-span-custom", 0)
+	_ = h.Handle(ctx, r)
+
+	c := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(c)
+	}()
+
+	select {
+	case <-c:
+		// ok: flush avvenuto entro custom timeout
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for custom per-span timeout flush")
+	}
+}
+
+// Test: per-span nil disables timeout (no flush)
+func TestPerSpanDisableTimeout(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	// default breve ma lo disabilitiamo per lo span
+	h := NewAsyncBufferedHandler(next, fm, 10, 50*time.Millisecond)
+	defer h.Close()
+
+	var tid trace.TraceID
+	copy(tid[:], []byte{8, 8, 8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	var sid trace.SpanID
+	copy(sid[:], []byte{8, 8, 3, 4, 5, 6, 7, 8})
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	// disabilito il timeout per questo span
+	h.StartSpan(ctx, tid.String(), nil)
+
+	// preparo next per rilevare eventuale forward (non ci deve essere)
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	next.wg = wg
+
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "per-span-disabled", 0)
+	_ = h.Handle(ctx, r)
+
+	// aspettiamo un tempo maggiore del default: se riceviamo qualcosa è un errore
+	c := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(c)
+	}()
+
+	select {
+	case <-c:
+		t.Fatal("unexpected flush: per-span timeout was disabled but flush occurred")
+	case <-time.After(200 * time.Millisecond):
+		// ok: nessun flush automatico
+	}
+
+	// cleanup esplicito
+	h.EndSpanSuccess(ctx, tid.String())
+}
+
+// Test: per-span pointer to 0 uses handler default timeout
+func TestPerSpanZeroUsesDefault(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	// default medio
+	defaultTimeout := 60 * time.Millisecond
+	h := NewAsyncBufferedHandler(next, fm, 10, defaultTimeout)
+	defer h.Close()
+
+	var tid trace.TraceID
+	copy(tid[:], []byte{7, 7, 7, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	var sid trace.SpanID
+	copy(sid[:], []byte{7, 7, 3, 4, 5, 6, 7, 8})
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	zero := time.Duration(0)
+	h.StartSpan(ctx, tid.String(), &zero) // dovrebbe usare defaultTimeout
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	next.wg = wg
+
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "per-span-zero", 0)
+	_ = h.Handle(ctx, r)
+
+	c := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(c)
+	}()
+
+	select {
+	case <-c:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for default timeout flush when per-span value == 0")
+	}
+}
