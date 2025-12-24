@@ -757,3 +757,84 @@ func TestStartSpanWithMinLevelFiltering(t *testing.T) {
 	// cleanup
 	h.EndSpanSuccess(ctx, traceID)
 }
+
+// --- TESTS PER I WRAPPER Debug/Info/Warning/Error ---
+
+// helper: costruisce un traceID valido (16 bytes) e restituisce il suo string
+func makeTestTraceID() string {
+	var tid trace.TraceID
+	copy(tid[:], []byte{9, 8, 7, 6, 5, 4, 3, 2, 1, 11, 12, 13, 14, 15, 16, 17})
+	return tid.String()
+}
+
+func TestWrappers_DebugInfoWarningError_Forwarding(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	h := NewAsyncBufferedHandler(next, fm, 10, 200*time.Millisecond)
+	defer h.Close()
+
+	traceID := makeTestTraceID()
+
+	// settiamo wg per aspettare 4 record inoltrati
+	wg := &sync.WaitGroup{}
+	wg.Add(4)
+	next.wg = wg
+
+	// Chiamo i wrapper
+	h.Debug(traceID, "debug-msg")
+	h.Info(traceID, "info-msg")
+	h.Warning(traceID, "warn-msg")
+	h.Error(traceID, "error-msg")
+
+	// aspettiamo che i record siano stati inoltrati (i record con traceID valido vanno bufferizzati
+	// e poi flushati solo su error/timeout; per semplicità verifichiamo che siano almeno ricevuti dal fake handler)
+	waitForRecords(t, next, 4, 500*time.Millisecond)
+
+	// verifichiamo i messaggi ricevuti
+	next.mu.Lock()
+	defer next.mu.Unlock()
+	if len(next.records) < 4 {
+		t.Fatalf("expected at least 4 records, got %d", len(next.records))
+	}
+
+	// costruiamo una mappa dei messaggi
+	msgs := map[string]bool{}
+	for _, r := range next.records {
+		msgs[r.Message] = true
+	}
+
+	expected := []string{"debug-msg", "info-msg", "warn-msg", "error-msg"}
+	for _, e := range expected {
+		if !msgs[e] {
+			t.Fatalf("expected message %q to be forwarded, not found", e)
+		}
+	}
+}
+
+// Test che il wrapper senza traceID forwardi immediatamente al next handler
+func TestWrappers_NoTrace_ImmediateForward(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	h := NewAsyncBufferedHandler(next, fm, 10, 200*time.Millisecond)
+	defer h.Close()
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	next.wg = wg
+
+	// call wrapper with empty traceID -> should immediately forward
+	h.Info("", "no-trace-msg")
+
+	c := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(c)
+	}()
+
+	select {
+	case <-c:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for immediate forward for no-trace wrapper")
+	}
+}

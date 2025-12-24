@@ -3,6 +3,7 @@ package pkg
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -293,8 +294,8 @@ func (h *AsyncBufferedHandler) StartSpan(ctx *context.Context, timeout *time.Dur
 		// fallback deterministico
 		now := time.Now().UnixNano()
 		// copy first 8 bytes of the hex representation
-		hex := fmt.Sprintf("%016x", now)
-		copy(sid[:], []byte(hex)[:8])
+		hexStr := fmt.Sprintf("%016x", now)
+		copy(sid[:], []byte(hexStr)[:8])
 	}
 	var baseCtx context.Context
 	if *ctx != nil {
@@ -768,4 +769,65 @@ func (h *AsyncBufferedHandler) sendControl(ctx context.Context, traceID string, 
 	}:
 	default:
 	}
+}
+
+// helper: costruisce un context contenente unoSpanContext con il traceID fornito.
+// Se traceID è vuoto o non decodificabile, restituisce context.Background().
+func (h *AsyncBufferedHandler) ctxWithTraceID(traceID string) context.Context {
+	if traceID == "" {
+		return context.Background()
+	}
+	// decode hex string (atteso 32 chars => 16 bytes)
+	b, err := hex.DecodeString(traceID)
+	if err != nil || len(b) != 16 {
+		return context.Background()
+	}
+	var tid trace.TraceID
+	copy(tid[:], b)
+	var sid trace.SpanID
+	if _, err := rand.Read(sid[:]); err != nil {
+		// fallback deterministico
+		now := time.Now().UnixNano()
+		hexStr := fmt.Sprintf("%016x", now)
+		copy(sid[:], []byte(hexStr)[:8])
+	}
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+	return trace.ContextWithSpanContext(context.Background(), sc)
+}
+
+// Debug: crea e invia un record di livello Debug associato al traceID fornito
+func (h *AsyncBufferedHandler) Debug(traceID, msg string) {
+	ctx := h.ctxWithTraceID(traceID)
+	r := slog.NewRecord(time.Now(), slog.LevelDebug, msg, 0)
+	_ = h.Handle(ctx, r)
+}
+
+// Info: crea e invia un record di livello Info associato al traceID fornito
+func (h *AsyncBufferedHandler) Info(traceID, msg string) {
+	ctx := h.ctxWithTraceID(traceID)
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, msg, 0)
+	_ = h.Handle(ctx, r)
+}
+
+// Warning: crea e invia un record di livello Warn associato al traceID fornito
+func (h *AsyncBufferedHandler) Warning(traceID, msg string) {
+	ctx := h.ctxWithTraceID(traceID)
+	r := slog.NewRecord(time.Now(), slog.LevelWarn, msg, 0)
+	_ = h.Handle(ctx, r)
+}
+
+// Error: crea e invia un record di livello Error associato al traceID fornito
+func (h *AsyncBufferedHandler) Error(traceID, msg string) {
+	ctx := h.ctxWithTraceID(traceID)
+	r := slog.NewRecord(time.Now(), slog.LevelError, msg, 0)
+	_ = h.Handle(ctx, r)
+}
+
+// Critical: mappa sul livello Error (slog non ha LevelCritical nella stdlib)
+// aggiunge l'attributo "critical=true" per distinguere la gravità.
+func (h *AsyncBufferedHandler) Critical(traceID, msg string) {
+	ctx := h.ctxWithTraceID(traceID)
+	r := slog.NewRecord(time.Now(), slog.LevelError, msg, 0)
+	r.AddAttrs(slog.Bool("critical", true))
+	_ = h.Handle(ctx, r)
 }
