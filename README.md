@@ -107,7 +107,7 @@ func main() {
 
 Se la libreria è pubblicata su GitHub sotto `github.com/Mrpagio/telemetry`, nel tuo `go.mod` del progetto consumer aggiungi:
 
-    require github.com/Mrpagio/telemetry v0.0.6
+    require github.com/Mrpagio/telemetry v0.0.7
 
 (per sviluppo locale puoi usare una direttiva `replace` per puntare alla copia locale del repository):
 
