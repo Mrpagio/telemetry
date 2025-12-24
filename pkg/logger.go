@@ -174,8 +174,13 @@ func (h *AsyncBufferedHandler) initMetrics() {
 //   - timeout != nil && *timeout == 0 => usare il timeout di default dell'handler
 //   - timeout != nil && *timeout > 0 => usare la durata specificata
 //
+// Nuovo: StartSpan ora accetta anche un parametro opzionale minLevel *slog.Level
+// che, se non-nil, imposta il livello minimo di log che verrà bufferizzato/inoltrato
+// per quello span (equivalente a chiamare SetSpanMinLevel(traceID, minLevel)).
+// Se minLevel == nil non viene modificata la policy di livello esistente per quello span.
+//
 // Se traceID è vuoto, proviamo a ricavarlo dal contesto. Metodo thread-safe.
-func (h *AsyncBufferedHandler) StartSpan(ctx context.Context, traceID string, timeout *time.Duration) {
+func (h *AsyncBufferedHandler) StartSpan(ctx context.Context, traceID string, timeout *time.Duration, minLevel *slog.Level) {
 	// se non fornito, recupera il traceID dal contesto (se esiste)
 	if traceID == "" {
 		s := trace.SpanContextFromContext(ctx)
@@ -202,6 +207,14 @@ func (h *AsyncBufferedHandler) StartSpan(ctx context.Context, traceID string, ti
 
 	// Memorizziamo la policy per questo span (nil => timeout disabilitato)
 	h.perSpanTimeouts[traceID] = timeout
+
+	// Nuovo comportamento: se viene fornito un minLevel non-nil, lo salviamo
+	// nella mappa perSpanMinLevels per applicare il filtro di livello per questo span.
+	// Nota: se minLevel == nil non modifichiamo la policy esistente. Per rimuovere
+	// esplicitamente il filtro usare SetSpanMinLevel(traceID, nil).
+	if minLevel != nil {
+		h.perSpanMinLevels[traceID] = minLevel
+	}
 
 	// Gestiamo il timer associato in base alla policy:
 	// - timeout == nil => rimuoviamo qualunque timer esistente (nessun OpTimeout)

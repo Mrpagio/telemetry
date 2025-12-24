@@ -492,7 +492,7 @@ func TestPerSpanCustomTimeout(t *testing.T) {
 
 	// imposto timeout custom brevissimo
 	custom := 50 * time.Millisecond
-	h.StartSpan(ctx, tid.String(), &custom)
+	h.StartSpan(ctx, tid.String(), &custom, nil)
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
@@ -531,7 +531,7 @@ func TestPerSpanDisableTimeout(t *testing.T) {
 	ctx := trace.ContextWithSpanContext(context.Background(), sc)
 
 	// disabilito il timeout per questo span
-	h.StartSpan(ctx, tid.String(), nil)
+	h.StartSpan(ctx, tid.String(), nil, nil)
 
 	// preparo next per rilevare eventuale forward (non ci deve essere)
 	wg := &sync.WaitGroup{}
@@ -576,7 +576,7 @@ func TestPerSpanZeroUsesDefault(t *testing.T) {
 	ctx := trace.ContextWithSpanContext(context.Background(), sc)
 
 	zero := time.Duration(0)
-	h.StartSpan(ctx, tid.String(), &zero) // dovrebbe usare defaultTimeout
+	h.StartSpan(ctx, tid.String(), &zero, nil) // dovrebbe usare defaultTimeout
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
@@ -653,7 +653,7 @@ func TestPerSpanMinLevelFiltering(t *testing.T) {
 	if next.records[len(next.records)-1].Message != "warn-should-pass" {
 		msg := next.records[len(next.records)-1].Message
 		next.mu.Unlock()
-		t.Fatalf("unexpected forwarded message for WARN: %q", msg)
+		t.Fatalf("unexpected forwarded message per WARN: %q", msg)
 	}
 	next.mu.Unlock()
 
@@ -684,4 +684,66 @@ func TestPerSpanMinLevelFiltering(t *testing.T) {
 		t.Fatalf("unexpected forwarded message after removing filter: %q", msg)
 	}
 	next.mu.Unlock()
+}
+
+// New test: StartSpan can accept minLevel and apply filtering equivalent to SetSpanMinLevel
+func TestStartSpanWithMinLevelFiltering(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	h := NewAsyncBufferedHandler(next, fm, 10, 200*time.Millisecond)
+	defer h.Close()
+
+	var tid trace.TraceID
+	copy(tid[:], []byte{6, 6, 6, 6, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	var sid trace.SpanID
+	copy(sid[:], []byte{6, 6, 3, 4, 5, 6, 7, 8})
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	// Imposto il livello minimo a WARN tramite StartSpan
+	minLevel := slog.LevelWarn
+	zero := time.Duration(0)
+	h.StartSpan(ctx, tid.String(), &zero, &minLevel)
+
+	// 1) INFO deve essere scartato
+	rInfo := slog.NewRecord(time.Now(), slog.LevelInfo, "info-dropped-by-startspan", 0)
+	_ = h.Handle(ctx, rInfo)
+	// attendiamo un po' per dare tempo al worker di processare
+	time.Sleep(100 * time.Millisecond)
+	next.mu.Lock()
+	if len(next.records) != 0 {
+		next.mu.Unlock()
+		t.Fatalf("expected 0 forwarded records for INFO below min level (StartSpan), got %d", len(next.records))
+	}
+	next.mu.Unlock()
+
+	// 2) WARN deve passare
+	rWarn := slog.NewRecord(time.Now(), slog.LevelWarn, "warn-passes-by-startspan", 0)
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	next.wg = wg
+	_ = h.Handle(ctx, rWarn)
+	c := make(chan struct{})
+	go func() { wg.Wait(); close(c) }()
+	select {
+	case <-c:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for WARN to be forwarded (StartSpan)")
+	}
+	// verifico messaggio
+	next.mu.Lock()
+	if len(next.records) == 0 {
+		next.mu.Unlock()
+		t.Fatal("expected at least one forwarded record for WARN (StartSpan)")
+	}
+	if next.records[len(next.records)-1].Message != "warn-passes-by-startspan" {
+		msg := next.records[len(next.records)-1].Message
+		next.mu.Unlock()
+		t.Fatalf("unexpected forwarded message (StartSpan WARN): %q", msg)
+	}
+	next.mu.Unlock()
+
+	// cleanup
+	h.EndSpanSuccess(ctx, tid.String())
 }
