@@ -2,6 +2,8 @@ package pkg
 
 import (
 	"context"
+	"crypto/rand"
+	"fmt"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -88,6 +90,10 @@ type AsyncBufferedHandler struct {
 	// per ogni traceID. Valore == nil => nessun filtro (accetta tutti i livelli).
 	// Se presente e non-nil, i record con livello < *minLevel verranno scartati.
 	perSpanMinLevels map[string]*slog.Level
+	// perSpanTags mantiene una lista di attributi (slog.Attr) derivati dai tag
+	// (stringhe) passate allo StartSpan per ogni traceID. Viene aggiunta ai record
+	// bufferizzati e inoltrati.
+	perSpanTags map[string][]slog.Attr
 	// timeoutDuration è il valore di default per gli span per i quali non sia
 	// stata impostata una policy esplicita (o per i quali la policy punta a 0).
 	timeoutDuration time.Duration
@@ -118,6 +124,7 @@ func NewAsyncBufferedHandler(next slog.Handler, meter MyMeter, bufferSize int, t
 		timers:           make(map[string]*time.Timer),
 		perSpanTimeouts:  make(map[string]*time.Duration), // inizializziamo la mappa
 		perSpanMinLevels: make(map[string]*slog.Level),    // inizializziamo la mappa dei min-level per span
+		perSpanTags:      make(map[string][]slog.Attr),    // inizializziamo la mappa dei tag per span
 		timeoutDuration:  timeout,
 		mu:               &sync.Mutex{},
 		wg:               &sync.WaitGroup{},
@@ -174,76 +181,130 @@ func (h *AsyncBufferedHandler) initMetrics() {
 //   - timeout != nil && *timeout == 0 => usare il timeout di default dell'handler
 //   - timeout != nil && *timeout > 0 => usare la durata specificata
 //
-// Nuovo: StartSpan ora accetta anche un parametro opzionale minLevel *slog.Level
-// che, se non-nil, imposta il livello minimo di log che verrà bufferizzato/inoltrato
-// per quello span (equivalente a chiamare SetSpanMinLevel(traceID, minLevel)).
-// Se minLevel == nil non viene modificata la policy di livello esistente per quello span.
+// Nuovo: StartSpan ora genera internamente un traceID univoco (non preso come input),
+// accetta anche un parametro opzionale minLevel *slog.Level che, se non-nil, imposta
+// il livello minimo di log che verrà bufferizzato/inoltrato per quello span
+// (equivalente a chiamare SetSpanMinLevel(traceID, minLevel)). Se minLevel == nil
+// non viene modificata la policy di livello esistente per quello span.
 //
-// Se traceID è vuoto, proviamo a ricavarlo dal contesto. Metodo thread-safe.
-func (h *AsyncBufferedHandler) StartSpan(ctx context.Context, traceID string, timeout *time.Duration, minLevel *slog.Level) {
-	// se non fornito, recupera il traceID dal contesto (se esiste)
-	if traceID == "" {
-		s := trace.SpanContextFromContext(ctx)
-		if s.IsValid() {
-			traceID = s.TraceID().String()
+// Nuovo: StartSpan accetta anche tags []string (nil o vuota) che verranno memorizzate
+// per il singolo span e aggiunte come attributi ai record bufferizzati/inoltrati.
+//
+// Restituisce il traceID generato e un context con lo SpanContext associato che il
+// chiamante può usare per inviare log che verranno associati a questo span.
+func (h *AsyncBufferedHandler) StartSpan(ctx *context.Context, timeout *time.Duration, minLevel *slog.Level, tags []string) (string, error) {
+	// Genero un traceID unico non presente nelle mappe del logger
+	var tid trace.TraceID
+	var tidStr string
+	for {
+		// genero 16 byte casuali
+		b := make([]byte, 16)
+		_, err := rand.Read(b)
+		if err != nil {
+			// fallback deterministico in caso di errore raro
+			now := time.Now().UnixNano()
+			copy(b[:], fmt.Sprintf("%016x", now))
 		}
-	}
-	if traceID == "" {
-		// non abbiamo un traceID valido: niente da impostare
-		return
-	}
+		copy(tid[:], b)
+		tidStr = tid.String()
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// Assicuriamoci che esista il buffer per il traceID; se non esiste lo creiamo
-	// e, se è presente un meter, incrementiamo il contatore degli span attivi.
-	if _, exists := h.buffers[traceID]; !exists {
-		h.buffers[traceID] = make([]slog.Record, 0)
-		if h.meter != nil {
-			h.activeSpansGauge.Add(ctx, 1)
-		}
-	}
-
-	// Memorizziamo la policy per questo span (nil => timeout disabilitato)
-	h.perSpanTimeouts[traceID] = timeout
-
-	// Nuovo comportamento: se viene fornito un minLevel non-nil, lo salviamo
-	// nella mappa perSpanMinLevels per applicare il filtro di livello per questo span.
-	// Nota: se minLevel == nil non modifichiamo la policy esistente. Per rimuovere
-	// esplicitamente il filtro usare SetSpanMinLevel(traceID, nil).
-	if minLevel != nil {
-		h.perSpanMinLevels[traceID] = minLevel
-	}
-
-	// Gestiamo il timer associato in base alla policy:
-	// - timeout == nil => rimuoviamo qualunque timer esistente (nessun OpTimeout)
-	// - timeout != nil => creiamo o resettiamo il timer con la durata corretta
-	if timeout == nil {
-		if t, ok := h.timers[traceID]; ok {
-			t.Stop()
-			delete(h.timers, traceID)
-		}
-		return
-	}
-
-	// calcoliamo la durata effettiva: 0 nel puntatore significa usare il default dell'handler
-	dur := h.timeoutDuration
-	if *timeout > 0 {
-		dur = *timeout
-	}
-
-	if t, ok := h.timers[traceID]; ok {
-		t.Reset(dur)
-	} else {
-		tr := traceID
-		h.timers[tr] = time.AfterFunc(dur, func() {
-			select {
-			case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
-			default:
+		// tieni il lock finché non hai impostato sia il buffer sia le policy per-span
+		h.mu.Lock()
+		_, inBuffers := h.buffers[tidStr]
+		_, inTimers := h.timers[tidStr]
+		_, inTimeouts := h.perSpanTimeouts[tidStr]
+		_, inMin := h.perSpanMinLevels[tidStr]
+		_, inTags := h.perSpanTags[tidStr]
+		collision := inBuffers || inTimers || inTimeouts || inMin || inTags
+		if !collision {
+			// segno il buffer (vuoto) per occupare l'ID e evitare race con altre StartSpan
+			h.buffers[tidStr] = make([]slog.Record, 0)
+			// use provided context value for metrics; if ctx pointer is nil use background
+			var ctxVal context.Context
+			if ctx != nil && *ctx != nil {
+				ctxVal = *ctx
+			} else {
+				ctxVal = context.Background()
 			}
-		})
+			if h.meter != nil {
+				h.activeSpansGauge.Add(ctxVal, 1)
+			}
+			// non rilascio il lock qui: procedo a impostare policy e timer sotto lo stesso lock
+			break
+		}
+		// collision: rilascio lock e riprovo
+		h.mu.Unlock()
 	}
+
+	// Ora siamo fuori dal loop e il lock è tenuto: impostiamo le policy e il timer in modo atomico
+	// Memorizzo la policy per questo span (nil => timeout disabilitato)
+	// (NOTA: il lock è già acquisito qui)
+	h.perSpanTimeouts[tidStr] = timeout
+	// memorizzo minLevel se fornito
+	if minLevel != nil {
+		h.perSpanMinLevels[tidStr] = minLevel
+	}
+	// memorizzo tags convertiti in slog.Attr
+	if len(tags) > 0 {
+		attrs := make([]slog.Attr, 0, len(tags))
+		for i, tg := range tags {
+			attrs = append(attrs, slog.String(fmt.Sprintf("tag.%d", i), tg))
+		}
+		h.perSpanTags[tidStr] = attrs
+	}
+	// Gestiamo il timer associato in base alla policy
+	if timeout == nil {
+		// Se timeout è esplicitamente nil, intendiamo DISABILITARE il timer per questo span.
+		// Rimuoviamo eventuali timer esistenti per sicurezza, ma non creiamo timer fittizi.
+		if t, ok := h.timers[tidStr]; ok {
+			t.Stop()
+			delete(h.timers, tidStr)
+		}
+		// rilascio lock
+		h.mu.Unlock()
+	} else {
+		// calcoliamo la durata effettiva: 0 nel puntatore significa usare il default dell'handler
+		dur := h.timeoutDuration
+		if *timeout > 0 {
+			dur = *timeout
+		}
+		if t, ok := h.timers[tidStr]; ok {
+			t.Reset(dur)
+		} else {
+			tr := tidStr
+			h.timers[tr] = time.AfterFunc(dur, func() {
+				select {
+				case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
+				default:
+				}
+			})
+		}
+		// rilascio lock
+		h.mu.Unlock()
+	}
+
+	// costruisco uno SpanContext usando il traceID generato e lo inserisco nel context passato
+	if ctx == nil {
+		return "", fmt.Errorf("nil context pointer")
+	}
+	// Genero anche uno SpanID non-zero così che lo SpanContext sia considerato valido
+	var sid trace.SpanID
+	if _, err := rand.Read(sid[:]); err != nil {
+		// fallback deterministico
+		now := time.Now().UnixNano()
+		// copy first 8 bytes of the hex representation
+		hex := fmt.Sprintf("%016x", now)
+		copy(sid[:], []byte(hex)[:8])
+	}
+	var baseCtx context.Context
+	if *ctx != nil {
+		baseCtx = *ctx
+	} else {
+		baseCtx = context.Background()
+	}
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+	*ctx = trace.ContextWithSpanContext(baseCtx, sc)
+	return tidStr, nil
 }
 
 // SetSpanMinLevel imposta (o rimuove quando level == nil) il livello minimo di log
@@ -439,6 +500,7 @@ func (h *AsyncBufferedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		timers:           h.timers,
 		perSpanTimeouts:  h.perSpanTimeouts,
 		perSpanMinLevels: h.perSpanMinLevels, // propagato
+		perSpanTags:      h.perSpanTags,      // propagato
 		timeoutDuration:  h.timeoutDuration,
 		attrs:            newTotalAttrs,
 		meter:            h.meter,
@@ -469,6 +531,7 @@ func (h *AsyncBufferedHandler) WithGroup(name string) slog.Handler {
 		timers:           h.timers,
 		perSpanTimeouts:  h.perSpanTimeouts,
 		perSpanMinLevels: h.perSpanMinLevels, // propagato
+		perSpanTags:      h.perSpanTags,      // propagato
 		timeoutDuration:  h.timeoutDuration,
 		attrs:            h.attrs,
 		meter:            h.meter,
@@ -525,7 +588,7 @@ func (h *AsyncBufferedHandler) handleLogRecord(cmd LogCommand) {
 	}
 	// se non esiste un timer, ne creo uno rispettando la policy per-span (se presente)
 	if _, exists := h.timers[tID]; !exists {
-		// controlliamo se esiste una policy per questo span
+		// controlliamo se esiste una politica per questo span
 		if policy, has := h.perSpanTimeouts[tID]; has {
 			if policy != nil {
 				// policy non-nil: 0 => default handler timeout; >0 => custom timeout
@@ -553,8 +616,12 @@ func (h *AsyncBufferedHandler) handleLogRecord(cmd LogCommand) {
 			})
 		}
 	}
-	// Aggiungo gli attributi al record di log
+	// Aggiungo gli attributi al record di log: prima quelli globali
 	cmd.Record.AddAttrs(cmd.Tags...)
+	// Aggiungo anche i tag specifici dello span se presenti
+	if spanAttrs, ok := h.perSpanTags[tID]; ok && len(spanAttrs) > 0 {
+		cmd.Record.AddAttrs(spanAttrs...)
+	}
 	// Aggiungo il record al buffer
 	h.buffers[tID] = append(h.buffers[tID], cmd.Record)
 	if h.meter != nil {
@@ -593,6 +660,8 @@ func (h *AsyncBufferedHandler) flush(ctx context.Context, traceID string) {
 		delete(h.perSpanTimeouts, traceID)
 		// Rimuovo anche la policy min-level per-span, se presente
 		delete(h.perSpanMinLevels, traceID)
+		// Rimuovo anche i tag per-span
+		delete(h.perSpanTags, traceID)
 		if h.meter != nil {
 			// Eseguito solo se il meter è impostato
 			// Aggiorno il contatore dei record attivi
@@ -634,6 +703,8 @@ func (h *AsyncBufferedHandler) cleanup(ctx context.Context, traceID string) {
 		delete(h.perSpanTimeouts, traceID)
 		// Rimuovo anche la policy min-level per-span
 		delete(h.perSpanMinLevels, traceID)
+		// Rimuovo anche i tag per-span
+		delete(h.perSpanTags, traceID)
 	}
 	h.mu.Unlock()
 }
@@ -666,6 +737,8 @@ func (h *AsyncBufferedHandler) EndSpanSuccess(ctx context.Context, traceID strin
 	delete(h.perSpanTimeouts, traceID)
 	// Rimuovo anche la policy min-level per-span
 	delete(h.perSpanMinLevels, traceID)
+	// Rimuovo anche i tag per-span
+	delete(h.perSpanTags, traceID)
 	h.mu.Unlock()
 
 	if h.meter != nil {

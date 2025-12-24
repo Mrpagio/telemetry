@@ -15,11 +15,16 @@ La libreria implementa un handler `AsyncBufferedHandler` che fornisce le seguent
 - Buffering per traceID: i record con contesto contenente uno SpanContext valido vengono bufferizzati per trace (traceID) invece di essere inoltrati immediatamente.
 - Flush on error: se arriva un record con livello >= ERROR il buffer relativo allo span viene flushato immediatamente.
 - Timeout per span: i buffer configurati vengono flusshati automaticamente dopo un timeout. Sono disponibili policy per-span per disabilitare o personalizzare il timeout.
-- Per-span timeout policy (`StartSpan`): è possibile impostare una policy di timeout per uno specifico traceID tramite `StartSpan(ctx, traceID, timeout *time.Duration)`. Il comportamento supportato è:
-  - `timeout == nil` => timeout DISABILITATO per quello span (nessun flush automatico per timeout);
-  - `timeout != nil && *timeout == 0` => usare il `timeout` di default dell'handler;
-  - `timeout != nil && *timeout > 0` => usare la durata specificata per quello span.
-- Per-span minimum log level (`SetSpanMinLevel`): è possibile imporre un livello minimo di log per uno span specifico con `SetSpanMinLevel(traceID, level *slog.Level)`. Se impostato, i record con livello inferiore verranno scartati per quello span. Passando `nil` si rimuove il filtro.
+- Per-span timeout policy (`StartSpan`): è possibile impostare una policy di timeout per uno specifico span quando si crea lo span tramite `StartSpan`.
+  - Nota: la funzione `StartSpan` ora genera internamente un `traceID` unico e scrive lo `SpanContext` nel `context` fornito (vedi dettagli sulla firma più avanti).
+  - `timeout` come *pointer* a `time.Duration` supporta tre comportamenti:
+    - `timeout == nil` => timeout DISABILITATO per quello span (nessun flush automatico per timeout);
+    - `timeout != nil && *timeout == 0` => usare il `timeout` di default dell'handler;
+    - `timeout != nil && *timeout > 0` => usare la durata specificata per quello span.
+- Per-span minimum log level: è possibile impostare un livello minimo di log per uno span specifico in due modi:
+  - passando `minLevel` a `StartSpan` (opzionale) — il filtro sarà applicato allo span creato;
+  - oppure chiamando `SetSpanMinLevel(traceID, level *slog.Level)` in un momento successivo.
+  - In entrambi i casi, se il valore è `nil` il filtro viene rimosso (accettati tutti i livelli).
 - API per la chiusura e per la fine degli span:
   - `EndSpanSuccess(ctx, traceID)` — termina lo span con successo e pulisce lo stato senza flushare i log bufferizzati;
   - `EndSpanError(ctx, traceID, err)` — termina lo span con errore, aggiunge un record di errore e forza il flush del buffer.
@@ -37,8 +42,8 @@ Queste sono le callable principali e i tipi di interesse definiti in `pkg/logger
 - (h *AsyncBufferedHandler) Enabled(ctx context.Context, level slog.Level) bool
 - (h *AsyncBufferedHandler) WithAttrs(attrs []slog.Attr) slog.Handler
 - (h *AsyncBufferedHandler) WithGroup(name string) slog.Handler
-- (h *AsyncBufferedHandler) StartSpan(ctx context.Context, traceID string, timeout *time.Duration)
-  - Inizializza/aggiorna il buffer e la policy di timeout per lo span; `timeout == nil` disabilita il timeout per quello span.
+- (h *AsyncBufferedHandler) StartSpan(ctx *context.Context, timeout *time.Duration, minLevel *slog.Level, tags []string) (string, error)
+  - Genera un nuovo `traceID` univoco, inizializza lo stato interno (buffer, policy) per quello span e scrive lo `SpanContext` nel `context` passato come puntatore (`*context.Context`). Restituisce il `traceID` generato o un errore (ad esempio se il puntatore ctx è nil).
 - (h *AsyncBufferedHandler) SetSpanMinLevel(traceID string, level *slog.Level)
   - Imposta il livello minimo di log per traceID; `level == nil` rimuove il filtro.
 - (h *AsyncBufferedHandler) EndSpanSuccess(ctx context.Context, traceID string)
@@ -79,29 +84,33 @@ func main() {
 
     // Per usare le policy per-span: creare un context con SpanContext contenente un traceID
     // (nella pratica questo viene normalmente fornito dall'instrumentazione OpenTelemetry)
-    // Esempio illustrativo: recupera traceID da un context con SpanContext
+    // Esempio illustrativo: iniziamo da un context vuoto e chiediamo all'handler di creare lo span
     ctx := context.Background()
 
-    // Esempio rapido: impostare un livello minimo WARN per uno span specifico
-    traceID := "0123456789abcdef0123456789abcdef" // esempio
-    lvl := slog.LevelWarn
-    h.SetSpanMinLevel(traceID, &lvl)
-    // per rimuovere il filtro:
-    // h.SetSpanMinLevel(traceID, nil)
-
-    // Esempio di start span con timeout personalizzato (nil per disabilitare timeout)
+    // Esempio: start span con timeout personalizzato e filtro min-level WARN
     custom := 500 * time.Millisecond
-    h.StartSpan(ctx, traceID, &custom)
-    // per disabilitare il timeout su questo span:
-    // h.StartSpan(ctx, traceID, nil)
+    lvl := slog.LevelWarn
+    traceID, err := h.StartSpan(&ctx, &custom, &lvl, []string{"http.route", "user"})
+    if err != nil {
+        // gestire l'errore (ad esempio panic o log)
+        panic(err)
+    }
+    // ora `ctx` contiene lo SpanContext inserito e puoi passarlo a logger.Handle per associare i log a questo span
+    logger.InfoContext(ctx, "request started")
 
-    // Quando lo span termina con successo (non vogliamo flushare i log bufferizzati):
-    // h.EndSpanSuccess(ctx, traceID)
+    // quando lo span termina con successo (senza voler forwardare i log bufferizzati):
+    h.EndSpanSuccess(ctx, traceID)
 
-    // Se lo span termina con errore e vogliamo forzare il flush:
+    // se lo span termina con errore e vogliamo forzare il flush dei log bufferizzati:
     // h.EndSpanError(ctx, traceID, errors.New("something went wrong"))
 }
 ```
+
+Note sull'uso di `StartSpan` e sul contesto
+-----------------------------------------
+- `StartSpan` ora riceve un puntatore a `context.Context` (`*context.Context`) e scrive il `SpanContext` creato dentro la variabile puntata (cioè fa `*ctx = trace.ContextWithSpanContext(...)`). Questo rende facile continuare a usare la stessa variabile `ctx` aggiornata dopo la chiamata.
+- Se passi `nil` come puntatore (`h.StartSpan(nil, ...)`) la funzione ritorna un errore: è necessario passare l'indirizzo di una variabile `context.Context`.
+- La funzione genera internamente un `traceID` (non lo riceve in ingresso) e lo restituisce: puoi usarlo con `SetSpanMinLevel`, `EndSpanSuccess`, `EndSpanError`.
 
 2) Esempio rapido per l'uso in un altro modulo (go.mod)
 
@@ -121,7 +130,7 @@ Note sui test e sugli strumenti di sviluppo
 -----------------------------------------
 Nel repository sono presenti test che usano due helper utili per simulare il comportamento delle metriche e del gestore finale:
 
-- `fakeMeter` — implementa l'interfaccia minimale `MyMeter` per creare strumenti finti e tracciare le chiamate alle API di metriche;
+- `fakeMeter` — implementa l'interfaccia minima `MyMeter` per creare strumenti finti e tracciare le chiamate alle API di metriche;
 - `fakeSlogHandler` — un handler che cattura i `slog.Record` inoltrati e permette di sincronizzare i test con `sync.WaitGroup`.
 
 Esempi di comandi utili per lo sviluppo e i test:

@@ -483,16 +483,12 @@ func TestPerSpanCustomTimeout(t *testing.T) {
 	h := NewAsyncBufferedHandler(next, fm, 10, 200*time.Millisecond)
 	defer h.Close()
 
-	var tid trace.TraceID
-	copy(tid[:], []byte{9, 9, 9, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
-	var sid trace.SpanID
-	copy(sid[:], []byte{9, 9, 3, 4, 5, 6, 7, 8})
-	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
-	ctx := trace.ContextWithSpanContext(context.Background(), sc)
-
-	// imposto timeout custom brevissimo
+	ctx := context.Background()
 	custom := 50 * time.Millisecond
-	h.StartSpan(ctx, tid.String(), &custom, nil)
+	traceID, err := h.StartSpan(&ctx, &custom, nil, nil)
+	if err != nil {
+		t.Fatalf("StartSpan error: %v", err)
+	}
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
@@ -513,6 +509,9 @@ func TestPerSpanCustomTimeout(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("timeout waiting for custom per-span timeout flush")
 	}
+
+	// cleanup
+	h.EndSpanSuccess(ctx, traceID)
 }
 
 // Test: per-span nil disables timeout (no flush)
@@ -523,15 +522,20 @@ func TestPerSpanDisableTimeout(t *testing.T) {
 	h := NewAsyncBufferedHandler(next, fm, 10, 50*time.Millisecond)
 	defer h.Close()
 
-	var tid trace.TraceID
-	copy(tid[:], []byte{8, 8, 8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
-	var sid trace.SpanID
-	copy(sid[:], []byte{8, 8, 3, 4, 5, 6, 7, 8})
-	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
-	ctx := trace.ContextWithSpanContext(context.Background(), sc)
-
+	ctx := context.Background()
 	// disabilito il timeout per questo span
-	h.StartSpan(ctx, tid.String(), nil, nil)
+	traceID, err := h.StartSpan(&ctx, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("StartSpan error: %v", err)
+	}
+
+	// ASSERT: StartSpan should have set an entry in perSpanTimeouts (value == nil)
+	h.mu.Lock()
+	_, ok := h.perSpanTimeouts[traceID]
+	h.mu.Unlock()
+	if !ok {
+		t.Fatalf("StartSpan did not set perSpanTimeouts for trace %s", traceID)
+	}
 
 	// preparo next per rilevare eventuale forward (non ci deve essere)
 	wg := &sync.WaitGroup{}
@@ -556,7 +560,7 @@ func TestPerSpanDisableTimeout(t *testing.T) {
 	}
 
 	// cleanup esplicito
-	h.EndSpanSuccess(ctx, tid.String())
+	h.EndSpanSuccess(ctx, traceID)
 }
 
 // Test: per-span pointer to 0 uses handler default timeout
@@ -568,15 +572,12 @@ func TestPerSpanZeroUsesDefault(t *testing.T) {
 	h := NewAsyncBufferedHandler(next, fm, 10, defaultTimeout)
 	defer h.Close()
 
-	var tid trace.TraceID
-	copy(tid[:], []byte{7, 7, 7, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
-	var sid trace.SpanID
-	copy(sid[:], []byte{7, 7, 3, 4, 5, 6, 7, 8})
-	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
-	ctx := trace.ContextWithSpanContext(context.Background(), sc)
-
+	ctx := context.Background()
 	zero := time.Duration(0)
-	h.StartSpan(ctx, tid.String(), &zero, nil) // dovrebbe usare defaultTimeout
+	traceID, err := h.StartSpan(&ctx, &zero, nil, nil) // dovrebbe usare defaultTimeout
+	if err != nil {
+		t.Fatalf("StartSpan error: %v", err)
+	}
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
@@ -597,6 +598,9 @@ func TestPerSpanZeroUsesDefault(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("timeout waiting for default timeout flush when per-span value == 0")
 	}
+
+	// cleanup
+	h.EndSpanSuccess(ctx, traceID)
 }
 
 // Test: per-span minimum log level filtering
@@ -693,17 +697,23 @@ func TestStartSpanWithMinLevelFiltering(t *testing.T) {
 	h := NewAsyncBufferedHandler(next, fm, 10, 200*time.Millisecond)
 	defer h.Close()
 
-	var tid trace.TraceID
-	copy(tid[:], []byte{6, 6, 6, 6, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
-	var sid trace.SpanID
-	copy(sid[:], []byte{6, 6, 3, 4, 5, 6, 7, 8})
-	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
-	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+	ctx := context.Background()
 
 	// Imposto il livello minimo a WARN tramite StartSpan
 	minLevel := slog.LevelWarn
 	zero := time.Duration(0)
-	h.StartSpan(ctx, tid.String(), &zero, &minLevel)
+	traceID, err := h.StartSpan(&ctx, &zero, &minLevel, nil)
+	if err != nil {
+		t.Fatalf("StartSpan error: %v", err)
+	}
+
+	// ASSERT: StartSpan should have set perSpanMinLevels for this traceID
+	h.mu.Lock()
+	if ml, ok := h.perSpanMinLevels[traceID]; !ok || ml == nil {
+		h.mu.Unlock()
+		t.Fatalf("StartSpan did not set perSpanMinLevels for trace %s", traceID)
+	}
+	h.mu.Unlock()
 
 	// 1) INFO deve essere scartato
 	rInfo := slog.NewRecord(time.Now(), slog.LevelInfo, "info-dropped-by-startspan", 0)
@@ -745,5 +755,5 @@ func TestStartSpanWithMinLevelFiltering(t *testing.T) {
 	next.mu.Unlock()
 
 	// cleanup
-	h.EndSpanSuccess(ctx, tid.String())
+	h.EndSpanSuccess(ctx, traceID)
 }
