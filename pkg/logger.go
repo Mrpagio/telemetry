@@ -84,6 +84,10 @@ type AsyncBufferedHandler struct {
 	// - non-nil pointer con valore == 0 => usare il timeout di default h.timeoutDuration
 	// - non-nil pointer con valore > 0 => usare la durata specificata
 	perSpanTimeouts map[string]*time.Duration
+	// perSpanMinLevels mantiene il livello minimo di log che verrà bufferizzato/inoltrato
+	// per ogni traceID. Valore == nil => nessun filtro (accetta tutti i livelli).
+	// Se presente e non-nil, i record con livello < *minLevel verranno scartati.
+	perSpanMinLevels map[string]*slog.Level
 	// timeoutDuration è il valore di default per gli span per i quali non sia
 	// stata impostata una policy esplicita (o per i quali la policy punta a 0).
 	timeoutDuration time.Duration
@@ -108,16 +112,17 @@ type AsyncBufferedHandler struct {
 
 func NewAsyncBufferedHandler(next slog.Handler, meter MyMeter, bufferSize int, timeout time.Duration) *AsyncBufferedHandler {
 	h := &AsyncBufferedHandler{
-		next:            next,
-		channel:         make(chan LogCommand, bufferSize),
-		buffers:         make(map[string][]slog.Record),
-		timers:          make(map[string]*time.Timer),
-		perSpanTimeouts: make(map[string]*time.Duration), // inizializziamo la mappa
-		timeoutDuration: timeout,
-		mu:              &sync.Mutex{},
-		wg:              &sync.WaitGroup{},
-		closeOnce:       &sync.Once{},
-		meter:           meter,
+		next:             next,
+		channel:          make(chan LogCommand, bufferSize),
+		buffers:          make(map[string][]slog.Record),
+		timers:           make(map[string]*time.Timer),
+		perSpanTimeouts:  make(map[string]*time.Duration), // inizializziamo la mappa
+		perSpanMinLevels: make(map[string]*slog.Level),    // inizializziamo la mappa dei min-level per span
+		timeoutDuration:  timeout,
+		mu:               &sync.Mutex{},
+		wg:               &sync.WaitGroup{},
+		closeOnce:        &sync.Once{},
+		meter:            meter,
 	}
 	var c int32 = 0
 	h.closed = &c
@@ -226,6 +231,23 @@ func (h *AsyncBufferedHandler) StartSpan(ctx context.Context, traceID string, ti
 			}
 		})
 	}
+}
+
+// SetSpanMinLevel imposta (o rimuove quando level == nil) il livello minimo di log
+// che verrà bufferizzato/inoltrato per il traceID specificato.
+// - level == nil => rimuove il filtro per quel traceID (accetta tutti i livelli)
+// - level != nil => solo record con Record.Level >= *level verranno considerati
+func (h *AsyncBufferedHandler) SetSpanMinLevel(traceID string, level *slog.Level) {
+	if traceID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if level == nil {
+		delete(h.perSpanMinLevels, traceID)
+		return
+	}
+	h.perSpanMinLevels[traceID] = level
 }
 
 // Close chiude il canale dei comandi e attende che il worker termini.
@@ -397,15 +419,16 @@ func (h *AsyncBufferedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 	// Costruisco un nuovo handler riutilizzando le risorse condivise (mutex, mappe, metriche)
 	return &AsyncBufferedHandler{
-		next:            h.next.WithAttrs(attrs),
-		channel:         h.channel,
-		mu:              h.mu,
-		buffers:         h.buffers,
-		timers:          h.timers,
-		perSpanTimeouts: h.perSpanTimeouts,
-		timeoutDuration: h.timeoutDuration,
-		attrs:           newTotalAttrs,
-		meter:           h.meter,
+		next:             h.next.WithAttrs(attrs),
+		channel:          h.channel,
+		mu:               h.mu,
+		buffers:          h.buffers,
+		timers:           h.timers,
+		perSpanTimeouts:  h.perSpanTimeouts,
+		perSpanMinLevels: h.perSpanMinLevels, // propagato
+		timeoutDuration:  h.timeoutDuration,
+		attrs:            newTotalAttrs,
+		meter:            h.meter,
 		// metriche
 		totalCounter:       h.totalCounter,
 		successCounter:     h.successCounter,
@@ -426,15 +449,16 @@ func (h *AsyncBufferedHandler) WithGroup(name string) slog.Handler {
 
 	// Costruisco un nuovo handler riutilizzando le risorse condivise (mutex, mappe, metriche)
 	return &AsyncBufferedHandler{
-		next:            h.next.WithGroup(name),
-		channel:         h.channel,
-		mu:              h.mu,
-		buffers:         h.buffers,
-		timers:          h.timers,
-		perSpanTimeouts: h.perSpanTimeouts,
-		timeoutDuration: h.timeoutDuration,
-		attrs:           h.attrs,
-		meter:           h.meter,
+		next:             h.next.WithGroup(name),
+		channel:          h.channel,
+		mu:               h.mu,
+		buffers:          h.buffers,
+		timers:           h.timers,
+		perSpanTimeouts:  h.perSpanTimeouts,
+		perSpanMinLevels: h.perSpanMinLevels, // propagato
+		timeoutDuration:  h.timeoutDuration,
+		attrs:            h.attrs,
+		meter:            h.meter,
 		// metriche
 		totalCounter:       h.totalCounter,
 		successCounter:     h.successCounter,
@@ -467,8 +491,17 @@ func (h *AsyncBufferedHandler) handleLogRecord(cmd LogCommand) {
 		return
 	}
 
-	// Se è una nuova traccia, avvio un timer per il timeout e incremento il gauge degli span attivi
+	// Controllo per-span minimum log level: se impostato e il livello del record è minore => scartalo
 	h.mu.Lock()
+	if minPtr, ok := h.perSpanMinLevels[tID]; ok && minPtr != nil {
+		minLevel := *minPtr
+		if cmd.Record.Level < minLevel {
+			// Non bufferizziamo né inoltriamo il record
+			h.mu.Unlock()
+			return
+		}
+	}
+	// Se è una nuova traccia, avvio un timer per il timeout e incremento il gauge degli span attivi
 	if _, exists := h.buffers[tID]; !exists {
 		// nuovo buffer
 		if h.meter != nil {
@@ -545,6 +578,8 @@ func (h *AsyncBufferedHandler) flush(ctx context.Context, traceID string) {
 		}
 		// Rimuovo anche la policy per-span associata, se presente
 		delete(h.perSpanTimeouts, traceID)
+		// Rimuovo anche la policy min-level per-span, se presente
+		delete(h.perSpanMinLevels, traceID)
 		if h.meter != nil {
 			// Eseguito solo se il meter è impostato
 			// Aggiorno il contatore dei record attivi
@@ -584,6 +619,8 @@ func (h *AsyncBufferedHandler) cleanup(ctx context.Context, traceID string) {
 		}
 		// Rimuovo anche la policy per-span
 		delete(h.perSpanTimeouts, traceID)
+		// Rimuovo anche la policy min-level per-span
+		delete(h.perSpanMinLevels, traceID)
 	}
 	h.mu.Unlock()
 }
@@ -614,6 +651,8 @@ func (h *AsyncBufferedHandler) EndSpanSuccess(ctx context.Context, traceID strin
 	}
 	// Rimuovo anche la policy per-span associata
 	delete(h.perSpanTimeouts, traceID)
+	// Rimuovo anche la policy min-level per-span
+	delete(h.perSpanMinLevels, traceID)
 	h.mu.Unlock()
 
 	if h.meter != nil {

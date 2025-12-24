@@ -598,3 +598,90 @@ func TestPerSpanZeroUsesDefault(t *testing.T) {
 		t.Fatal("timeout waiting for default timeout flush when per-span value == 0")
 	}
 }
+
+// Test: per-span minimum log level filtering
+func TestPerSpanMinLevelFiltering(t *testing.T) {
+	fm := newFakeMeter()
+	next := newFakeSlogHandler()
+	h := NewAsyncBufferedHandler(next, fm, 10, 200*time.Millisecond)
+	defer h.Close()
+
+	// costruisco un ctx con SpanContext valido contenente un traceID
+	var tid trace.TraceID
+	copy(tid[:], []byte{4, 4, 4, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	var sid trace.SpanID
+	copy(sid[:], []byte{4, 4, 3, 4, 5, 6, 7, 8})
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	// Imposto il livello minimo a WARN per questo span
+	minLevel := slog.LevelWarn
+	h.SetSpanMinLevel(tid.String(), &minLevel)
+
+	// 1) Invio un record INFO: non dovrebbe essere inoltrato
+	rInfo := slog.NewRecord(time.Now(), slog.LevelInfo, "info-should-be-dropped", 0)
+	_ = h.Handle(ctx, rInfo)
+	// attendiamo un po' per dare tempo al worker di processare
+	time.Sleep(100 * time.Millisecond)
+	next.mu.Lock()
+	if len(next.records) != 0 {
+		next.mu.Unlock()
+		t.Fatalf("expected 0 forwarded records for INFO below min level, got %d", len(next.records))
+	}
+	next.mu.Unlock()
+
+	// 2) Invio un record WARN: dovrebbe essere inoltrato
+	rWarn := slog.NewRecord(time.Now(), slog.LevelWarn, "warn-should-pass", 0)
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	next.wg = wg
+	_ = h.Handle(ctx, rWarn)
+	c := make(chan struct{})
+	go func() { wg.Wait(); close(c) }()
+	select {
+	case <-c:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for WARN to be forwarded")
+	}
+	// verifico messaggio
+	next.mu.Lock()
+	if len(next.records) == 0 {
+		next.mu.Unlock()
+		t.Fatal("expected at least one forwarded record for WARN")
+	}
+	if next.records[len(next.records)-1].Message != "warn-should-pass" {
+		msg := next.records[len(next.records)-1].Message
+		next.mu.Unlock()
+		t.Fatalf("unexpected forwarded message for WARN: %q", msg)
+	}
+	next.mu.Unlock()
+
+	// 3) Rimuovo il filtro e invio INFO: ora dovrebbe essere inoltrato
+	h.SetSpanMinLevel(tid.String(), nil)
+	rInfo2 := slog.NewRecord(time.Now(), slog.LevelInfo, "info-should-pass-after-remove", 0)
+	wg2 := &sync.WaitGroup{}
+	wg2.Add(1)
+	next.wg = wg2
+	_ = h.Handle(ctx, rInfo2)
+	c2 := make(chan struct{})
+	go func() { wg2.Wait(); close(c2) }()
+	select {
+	case <-c2:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for INFO to be forwarded after removing min-level filter")
+	}
+	// verifico messaggio
+	next.mu.Lock()
+	if len(next.records) == 0 {
+		next.mu.Unlock()
+		t.Fatal("expected at least one forwarded record after removing filter")
+	}
+	if next.records[len(next.records)-1].Message != "info-should-pass-after-remove" {
+		msg := next.records[len(next.records)-1].Message
+		next.mu.Unlock()
+		t.Fatalf("unexpected forwarded message after removing filter: %q", msg)
+	}
+	next.mu.Unlock()
+}
