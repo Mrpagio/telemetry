@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"context"
+
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
@@ -31,9 +32,9 @@ type Int64UpDownCounterLike interface {
 	Add(ctx context.Context, value int64, opts ...metric.AddOption)
 }
 
-// FakeMeter è un'interfaccia minimale che rappresenta un meter fake per i test
+// MyMeter è un'interfaccia minimale che rappresenta un meter fake per i test
 // (fornisce solo gli strumenti che il handler utilizza).
-type FakeMeter interface {
+type MyMeter interface {
 	Int64Counter(name string, opts ...metric.InstrumentOption) (Int64CounterLike, error)
 	Int64UpDownCounter(name string, opts ...metric.InstrumentOption) (Int64UpDownCounterLike, error)
 }
@@ -68,6 +69,7 @@ type AsyncBufferedHandler struct {
 	timers          map[string]*time.Timer   // Timer attivi per traceID
 	timeoutDuration time.Duration
 	attrs           []slog.Attr // attributi da aggiungere ai record
+	meter           MyMeter     // Adattatore del Meter OTel
 
 	// Metriche OTel per Report Temporali
 	totalCounter   Int64CounterLike // Contatore totale delle operazioni
@@ -85,7 +87,7 @@ type AsyncBufferedHandler struct {
 	closed    *int32 // flag atomico condiviso
 }
 
-func NewAsyncBufferedHandler(next slog.Handler, meter FakeMeter, bufferSize int, timeout time.Duration) *AsyncBufferedHandler {
+func NewAsyncBufferedHandler(next slog.Handler, meter MyMeter, bufferSize int, timeout time.Duration) *AsyncBufferedHandler {
 	h := &AsyncBufferedHandler{
 		next:            next,
 		channel:         make(chan LogCommand, bufferSize),
@@ -95,19 +97,13 @@ func NewAsyncBufferedHandler(next slog.Handler, meter FakeMeter, bufferSize int,
 		mu:              &sync.Mutex{},
 		wg:              &sync.WaitGroup{},
 		closeOnce:       &sync.Once{},
+		meter:           meter,
 	}
 	var c int32 = 0
 	h.closed = &c
 
 	// Inizializzazione delle metriche usando il meter fornito
-	// Le API del meter ritornano (instrument, error) — qui scartiamo l'errore con _.
-	h.totalCounter, _ = meter.Int64Counter("logging_total_operations", metric.WithDescription("Somma totale delle operazioni di logging"))
-	h.successCounter, _ = meter.Int64Counter("logging_success_operations", metric.WithDescription("Contatore delle operazioni di successo"))
-	h.errorCounter, _ = meter.Int64Counter("logging_error_operations", metric.WithDescription("Contatore delle operazioni di errore"))
-	h.dropCounter, _ = meter.Int64Counter("logging_dropped_operations", metric.WithDescription("Contatore delle operazioni scartate per via del buffer pieno"))
-
-	h.activeSpansGauge, _ = meter.Int64UpDownCounter("logging_active_spans", metric.WithDescription("Contatore degli span attivi"))
-	h.activeRecordsGauge, _ = meter.Int64UpDownCounter("logging_active_records", metric.WithDescription("Contatore dei record attivi"))
+	h.initMetrics()
 
 	// avvio worker con waitgroup per permettere un shutdown controllato
 	h.wg.Add(1)
@@ -118,6 +114,32 @@ func NewAsyncBufferedHandler(next slog.Handler, meter FakeMeter, bufferSize int,
 		}
 	}()
 	return h
+}
+
+// SetMeter permette di impostare o cambiare il meter usato per le metriche
+func (h *AsyncBufferedHandler) SetMeter(meter MyMeter) {
+	h.meter = meter
+	// re-inizializzo le metriche con il nuovo meter
+	h.initMetrics()
+}
+
+func (h *AsyncBufferedHandler) initMetrics() {
+	if h.meter != nil {
+		// Le API del meter ritornano (instrument, error) — qui scartiamo l'errore con _.
+		h.totalCounter, _ = h.meter.Int64Counter("logging_total_operations", metric.WithDescription("Somma totale delle operazioni di logging"))
+		h.successCounter, _ = h.meter.Int64Counter("logging_success_operations", metric.WithDescription("Contatore delle operazioni di successo"))
+		h.errorCounter, _ = h.meter.Int64Counter("logging_error_operations", metric.WithDescription("Contatore delle operazioni di errore"))
+		h.dropCounter, _ = h.meter.Int64Counter("logging_dropped_operations", metric.WithDescription("Contatore delle operazioni scartate per via del buffer pieno"))
+
+		h.activeSpansGauge, _ = h.meter.Int64UpDownCounter("logging_active_spans", metric.WithDescription("Contatore degli span attivi"))
+		h.activeRecordsGauge, _ = h.meter.Int64UpDownCounter("logging_active_records", metric.WithDescription("Contatore dei record attivi"))
+	} else {
+		h.totalCounter = nil
+		h.successCounter = nil
+		h.errorCounter = nil
+		h.dropCounter = nil
+		h.activeSpansGauge = nil
+	}
 }
 
 // Close chiude il canale dei comandi e attende che il worker termini.
@@ -149,51 +171,77 @@ func (h *AsyncBufferedHandler) process(cmd LogCommand) {
 	switch cmd.Op {
 
 	case OpReleaseSuccess:
-		// Aggiorno le metriche
-		h.successCounter.Add(cmd.Context, 1)
-		h.totalCounter.Add(cmd.Context, 1, metric.WithAttributes(attribute.String("status", "success")))
-		// Chiamo il metodo per gestire il rilascio delle risorse
-		h.cleanup(cmd.Context, cmd.TraceID)
+		h.processOpReleaseSuccess(cmd)
 
 	case OpReleaseError:
-		// Se è presente un errore, lo aggiungiamo al buffer come record di errore
-		if cmd.Err != nil {
-			r := slog.NewRecord(time.Now(), slog.LevelError, "OpReleaseErr", 0)
-			r.AddAttrs(slog.String("err", cmd.Err.Error()))
-			// Aggiungiamo il record al buffer in modo thread-safe
-			h.mu.Lock()
-			// assicurati che esista un timer per il traceID
-			if _, exists := h.timers[cmd.TraceID]; !exists {
-				h.activeSpansGauge.Add(cmd.Context, 1)
-				// creazione timer non-bloccante: invio OpTimeout sul canale
-				tr := cmd.TraceID
-				h.timers[tr] = time.AfterFunc(h.timeoutDuration, func() {
-					select {
-					case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
-					default:
-					}
-				})
-			}
-			// bufferizzo il record di errore
-			h.buffers[cmd.TraceID] = append(h.buffers[cmd.TraceID], r)
-			h.activeRecordsGauge.Add(cmd.Context, 1)
-			h.mu.Unlock()
-		}
-		// Chiamo il metodo per scrivere i log e pulire le risorse
-		h.flush(cmd.Context, cmd.TraceID)
+		h.processOpReleaseError(cmd)
 
 	case OpTimeout:
-		// Aggiorno le metriche
-		h.errorCounter.Add(cmd.Context, 1, metric.WithAttributes(attribute.String("cause", "timeout")))
-		h.totalCounter.Add(cmd.Context, 1, metric.WithAttributes(attribute.String("status", "timeout"), attribute.String("op", "timeout")))
-
-		// Chiamo il metodo per scrivere i log e pulire le risorse
-		h.flush(cmd.Context, cmd.TraceID)
+		h.processOpTimeout(cmd)
 
 	case OpLog:
 		// Chiamo il metodo per gestire il log
 		h.handleLogRecord(cmd)
 	}
+}
+
+// processOpReleaseSuccess gestisce il rilascio delle risorse in caso di successo senza invio di log
+func (h *AsyncBufferedHandler) processOpReleaseSuccess(cmd LogCommand) {
+	// Controlle se il meter è impostato
+	if h.meter != nil {
+		// Aggiorno le metriche
+		h.successCounter.Add(cmd.Context, 1)
+		h.totalCounter.Add(cmd.Context, 1, metric.WithAttributes(attribute.String("status", "success")))
+		// Chiamo il metodo per gestire il rilascio delle risorse
+	}
+	// Chiamo il metodo per pulire le risorse senza scrivere i log (in ogni caso di successo)
+	h.cleanup(cmd.Context, cmd.TraceID)
+}
+
+// processOpReleaseError gestisce il rilascio delle risorse in caso di errore, forzando il flush dei log
+func (h *AsyncBufferedHandler) processOpReleaseError(cmd LogCommand) {
+	// Se è presente un errore, lo aggiungiamo al buffer come record di errore
+	if cmd.Err != nil {
+		r := slog.NewRecord(time.Now(), slog.LevelError, "OpReleaseErr", 0)
+		r.AddAttrs(slog.String("err", cmd.Err.Error()))
+		// Aggiungiamo il record al buffer in modo thread-safe
+		h.mu.Lock()
+		// assicurati che esista un timer per il traceID
+		if _, exists := h.timers[cmd.TraceID]; !exists {
+			if h.meter != nil {
+				// eseguito solo se il meter è impostato
+				h.activeSpansGauge.Add(cmd.Context, 1)
+			}
+			// creazione timer non-bloccante: invio OpTimeout sul canale
+			tr := cmd.TraceID
+			h.timers[tr] = time.AfterFunc(h.timeoutDuration, func() {
+				select {
+				case h.channel <- LogCommand{Op: OpTimeout, Context: context.Background(), TraceID: tr}:
+				default:
+				}
+			})
+		}
+		// bufferizzo il record di errore
+		h.buffers[cmd.TraceID] = append(h.buffers[cmd.TraceID], r)
+		if h.meter != nil {
+			// eseguito solo se il meter è impostato
+			h.activeRecordsGauge.Add(cmd.Context, 1)
+		}
+		h.mu.Unlock()
+	}
+	// Chiamo il metodo per scrivere i log e pulire le risorse
+	h.flush(cmd.Context, cmd.TraceID)
+}
+
+func (h *AsyncBufferedHandler) processOpTimeout(cmd LogCommand) {
+	if h.meter != nil {
+		// Eseguito solo se il meter è impostato
+		// Aggiorno le metriche
+		h.errorCounter.Add(cmd.Context, 1, metric.WithAttributes(attribute.String("cause", "timeout")))
+		h.totalCounter.Add(cmd.Context, 1, metric.WithAttributes(attribute.String("status", "timeout"), attribute.String("op", "timeout")))
+	}
+	// Chiamo il metodo per scrivere i log e pulire le risorse
+	h.flush(cmd.Context, cmd.TraceID)
 }
 
 // Handle implementa l'interfaccia slog.Handler
@@ -213,11 +261,19 @@ func (h *AsyncBufferedHandler) Handle(ctx context.Context, record slog.Record) e
 		Tags:    h.attrs,
 	}:
 	default:
-		// Canale pieno, scarta il log e incrementa il contatore dei drop
+		// Canale pieno
+		h.handleDrop(ctx)
+	}
+	return nil
+}
+
+// handleDrop viene chiamato quando un log viene scartato a causa del canale pieno
+func (h *AsyncBufferedHandler) handleDrop(ctx context.Context) {
+	if h.meter != nil {
+		// Eseguito solo se il meter è impostato
 		h.dropCounter.Add(ctx, 1)
 		h.totalCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("status", "dropped")))
 	}
-	return nil
 }
 
 // Enabled implementa l'interfaccia slog.Handler
@@ -247,6 +303,7 @@ func (h *AsyncBufferedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		timers:          h.timers,
 		timeoutDuration: h.timeoutDuration,
 		attrs:           newTotalAttrs,
+		meter:           h.meter,
 		// metriche
 		totalCounter:       h.totalCounter,
 		successCounter:     h.successCounter,
@@ -275,6 +332,7 @@ func (h *AsyncBufferedHandler) WithGroup(name string) slog.Handler {
 		timers:          h.timers,
 		timeoutDuration: h.timeoutDuration,
 		attrs:           h.attrs,
+		meter:           h.meter,
 		// metriche
 		totalCounter:       h.totalCounter,
 		successCounter:     h.successCounter,
@@ -311,8 +369,11 @@ func (h *AsyncBufferedHandler) handleLogRecord(cmd LogCommand) {
 	h.mu.Lock()
 	if _, exists := h.buffers[tID]; !exists {
 		// nuovo buffer
-		// incremento gli span attivi
-		h.activeSpansGauge.Add(cmd.Context, 1)
+		if h.meter != nil {
+			// eseguito solo se il meter è impostato
+			// incremento gli span attivi
+			h.activeSpansGauge.Add(cmd.Context, 1)
+		}
 	}
 	// se non esiste un timer, ne creo uno
 	if _, exists := h.timers[tID]; !exists {
@@ -329,15 +390,22 @@ func (h *AsyncBufferedHandler) handleLogRecord(cmd LogCommand) {
 	cmd.Record.AddAttrs(cmd.Tags...)
 	// Aggiungo il record al buffer
 	h.buffers[tID] = append(h.buffers[tID], cmd.Record)
-	h.activeRecordsGauge.Add(cmd.Context, 1)
+	if h.meter != nil {
+		// eseguito solo se il meter è impostato
+		// incremento il contatore dei record attivi
+		h.activeRecordsGauge.Add(cmd.Context, 1)
+	}
 	// Determino se serve un flush immediato
 	forceFlush := cmd.Record.Level >= slog.LevelError
 	h.mu.Unlock()
 
 	if forceFlush {
-		// Incremento il contatore delle operazioni di errore
-		h.errorCounter.Add(cmd.Context, 1, metric.WithAttributes(attribute.String("cause", "immediate_flush")))
-		h.totalCounter.Add(cmd.Context, 1, metric.WithAttributes(attribute.String("status", "immediate_flush")))
+		if h.meter != nil {
+			// Eseguito solo se il meter è impostato
+			// Aggiorno le metriche
+			h.errorCounter.Add(cmd.Context, 1, metric.WithAttributes(attribute.String("cause", "immediate_flush")))
+			h.totalCounter.Add(cmd.Context, 1, metric.WithAttributes(attribute.String("status", "immediate_flush")))
+		}
 		h.flush(cmd.Context, tID)
 	}
 }
@@ -354,10 +422,13 @@ func (h *AsyncBufferedHandler) flush(ctx context.Context, traceID string) {
 			t.Stop()
 			delete(h.timers, traceID)
 		}
-		// Aggiorno il contatore dei record attivi
-		h.activeRecordsGauge.Add(ctx, int64(-len(recs)))
-		// Aggiorno il contatore degli span attivi
-		h.activeSpansGauge.Add(ctx, -1)
+		if h.meter != nil {
+			// Eseguito solo se il meter è impostato
+			// Aggiorno il contatore dei record attivi
+			h.activeRecordsGauge.Add(ctx, int64(-len(recs)))
+			// Aggiorno il contatore degli span attivi
+			h.activeSpansGauge.Add(ctx, -1)
+		}
 	}
 	h.mu.Unlock()
 
@@ -374,10 +445,14 @@ func (h *AsyncBufferedHandler) flush(ctx context.Context, traceID string) {
 func (h *AsyncBufferedHandler) cleanup(ctx context.Context, traceID string) {
 	h.mu.Lock()
 	if recs, ok := h.buffers[traceID]; ok {
-		// Aggiorno il contatore dei record attivi
-		h.activeRecordsGauge.Add(ctx, int64(-len(recs)))
-		// Aggiorno il contatore degli span attivi
-		h.activeSpansGauge.Add(ctx, -1)
+		if h.meter != nil {
+			// Eseguito solo se il meter è impostato
+			// Aggiorno il contatore dei record attivi
+			h.activeRecordsGauge.Add(ctx, int64(-len(recs)))
+			// Aggiorno il contatore degli span attivi
+			h.activeSpansGauge.Add(ctx, -1)
+		}
+
 		// Rimuovo il buffer e il timer
 		delete(h.buffers, traceID)
 		if t, tok := h.timers[traceID]; tok {
@@ -402,17 +477,23 @@ func (h *AsyncBufferedHandler) EndSpanSuccess(ctx context.Context, traceID strin
 		delete(h.timers, traceID)
 	}
 	if recs, ok := h.buffers[traceID]; ok {
-		// Aggiorno i contatori
-		h.activeRecordsGauge.Add(ctx, int64(-len(recs)))
-		h.activeSpansGauge.Add(ctx, -1)
+		if h.meter != nil {
+			// Eseguito solo se il meter è impostato
+			// Aggiorno i contatori
+			h.activeRecordsGauge.Add(ctx, int64(-len(recs)))
+			h.activeSpansGauge.Add(ctx, -1)
+		}
+
 		// Rimuovo il buffer
 		delete(h.buffers, traceID)
 	}
 	h.mu.Unlock()
 
-	// Aggiorno le metriche di successo (come faceva OpReleaseSuccess)
-	h.successCounter.Add(ctx, 1)
-	h.totalCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("status", "success")))
+	if h.meter != nil {
+		// Aggiorno le metriche di successo (come faceva OpReleaseSuccess)
+		h.successCounter.Add(ctx, 1)
+		h.totalCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("status", "success")))
+	}
 }
 
 // EndSpanError segnala la fine di uno span con errore

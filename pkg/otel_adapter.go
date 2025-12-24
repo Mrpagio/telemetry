@@ -4,13 +4,13 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
-// MeterAdapter adatta un metric.Meter reale all'interfaccia FakeMeter usata dal package.
+// MeterAdapter adatta un metric.Meter reale all'interfaccia MyMeter usata dal package.
 // Questo permette a chi importa il package di passare un meter reale senza cambiare API.
 type MeterAdapter struct {
 	m metric.Meter
 }
 
-// NewMeterAdapter ritorna un adattatore che implementa FakeMeter
+// NewMeterAdapter ritorna un adattatore che implementa MyMeter
 func NewMeterAdapter(m metric.Meter) *MeterAdapter {
 	return &MeterAdapter{m: m}
 }
